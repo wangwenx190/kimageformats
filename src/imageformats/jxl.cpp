@@ -8,6 +8,7 @@
 
 #include <QLoggingCategory>
 #include <QThread>
+#include "kimageformats_decode_feedback.h"
 #include <QtGlobal>
 
 #include "jxl_p.h"
@@ -163,6 +164,14 @@ bool QJpegXLHandler::ensureALLCounted() const
     return that->countALLFrames();
 }
 
+namespace {
+JxlDecoderStatus processJxlInput(JxlDecoder *decoder)
+{
+    const auto *feedback = KImageFormats::decodeContext.feedback;
+    return feedback && feedback->stopped() ? JXL_DEC_ERROR : JxlDecoderProcessInput(decoder);
+}
+}
+
 bool QJpegXLHandler::ensureDecoder()
 {
     if (m_decoder) {
@@ -196,12 +205,11 @@ bool QJpegXLHandler::ensureDecoder()
     JxlDecoderSetKeepOrientation(m_decoder, true);
 #endif
 
-    int num_worker_threads = QThread::idealThreadCount();
-    if (!m_runner && num_worker_threads >= 4) {
-        /* use half of the threads because plug-in is usually used in environment
-         * where application performs other tasks in the background (pre-load other images) */
-        num_worker_threads = num_worker_threads / 2;
-        num_worker_threads = qBound(2, num_worker_threads, 64);
+    const int threads = KImageFormats::decodeContext.threads;
+    const int ideal = QThread::idealThreadCount();
+    const int num_worker_threads = threads > 0 ? threads - 1 :
+        (ideal >= 4 ? qBound(2, ideal / 2, 64) : 0);
+    if (!m_runner && num_worker_threads > 0) {
         m_runner = JxlThreadParallelRunnerCreate(nullptr, num_worker_threads);
 
         if (JxlDecoderSetParallelRunner(m_decoder, JxlThreadParallelRunner, m_runner) != JXL_DEC_SUCCESS) {
@@ -226,7 +234,7 @@ bool QJpegXLHandler::ensureDecoder()
         return false;
     }
 
-    status = JxlDecoderProcessInput(m_decoder);
+    status = processJxlInput(m_decoder);
     if (status == JXL_DEC_ERROR) {
         qCWarning(LOG_JXLPLUGIN, "ERROR: JXL decoding failed");
         m_parseState = ParseJpegXLError;
@@ -267,7 +275,7 @@ bool QJpegXLHandler::countALLFrames()
         return false;
     }
 
-    JxlDecoderStatus status = JxlDecoderProcessInput(m_decoder);
+    JxlDecoderStatus status = processJxlInput(m_decoder);
     if (status != JXL_DEC_COLOR_ENCODING) {
         qCWarning(LOG_JXLPLUGIN, "Unexpected event %d instead of JXL_DEC_COLOR_ENCODING", status);
         m_parseState = ParseJpegXLError;
@@ -380,7 +388,7 @@ bool QJpegXLHandler::countALLFrames()
         JxlFrameHeader frame_header;
         int delay;
 
-        for (status = JxlDecoderProcessInput(m_decoder); status != JXL_DEC_SUCCESS; status = JxlDecoderProcessInput(m_decoder)) {
+        for (status = processJxlInput(m_decoder); status != JXL_DEC_SUCCESS; status = processJxlInput(m_decoder)) {
             if (status != JXL_DEC_FRAME) {
                 switch (status) {
                 case JXL_DEC_ERROR:
@@ -505,8 +513,9 @@ bool QJpegXLHandler::countALLFrames()
 
 bool QJpegXLHandler::decode_one_frame()
 {
-    JxlDecoderStatus status = JxlDecoderProcessInput(m_decoder);
-    if (status != JXL_DEC_NEED_IMAGE_OUT_BUFFER) {
+    JxlDecoderStatus status = processJxlInput(m_decoder);
+    if (status != JXL_DEC_NEED_IMAGE_OUT_BUFFER &&
+        (status != JXL_DEC_FRAME_PROGRESSION || m_isCMYK)) {
         qCWarning(LOG_JXLPLUGIN, "Unexpected event %d instead of JXL_DEC_NEED_IMAGE_OUT_BUFFER", status);
         m_parseState = ParseJpegXLError;
         return false;
@@ -604,7 +613,7 @@ bool QJpegXLHandler::decode_one_frame()
                 return false;
             }
 
-            status = JxlDecoderProcessInput(m_decoder);
+            status = processJxlInput(m_decoder);
             if (status != JXL_DEC_FULL_IMAGE) {
                 free(pixels_black);
                 pixels_black = nullptr;
@@ -717,7 +726,7 @@ bool QJpegXLHandler::decode_one_frame()
                 return false;
             }
 
-            status = JxlDecoderProcessInput(m_decoder);
+            status = processJxlInput(m_decoder);
             if (status != JXL_DEC_FULL_IMAGE) {
                 free(pixels_black);
                 pixels_black = nullptr;
@@ -790,7 +799,30 @@ bool QJpegXLHandler::decode_one_frame()
             return false;
         }
 
-        status = JxlDecoderProcessInput(m_decoder);
+        // A DC progression can precede NEED_IMAGE_OUT_BUFFER. Keep that
+        // paused step, attach our normal output buffer, then flush it before
+        // continuing the same decoder. Later frames may request the buffer again.
+        while (status == JXL_DEC_FRAME_PROGRESSION || status == JXL_DEC_NEED_IMAGE_OUT_BUFFER) {
+            auto *feedback = KImageFormats::decodeContext.feedback;
+            if (feedback && feedback->stopped()) {
+                m_parseState = ParseJpegXLError;
+                return false;
+            }
+            if (status == JXL_DEC_NEED_IMAGE_OUT_BUFFER &&
+                JxlDecoderSetImageOutBuffer(m_decoder, &m_input_pixel_format,
+                                            m_current_image.bits(), rgb_buffer_size) != JXL_DEC_SUCCESS) {
+                m_parseState = ParseJpegXLError;
+                return false;
+            }
+            if (status == JXL_DEC_FRAME_PROGRESSION && feedback && !feedback->delivered &&
+                JxlDecoderFlushImage(m_decoder) == JXL_DEC_SUCCESS)
+                feedback->offer(m_current_image);
+            if (feedback && feedback->stopped()) {
+                m_parseState = ParseJpegXLError;
+                return false;
+            }
+            status = processJxlInput(m_decoder);
+        }
         if (status != JXL_DEC_FULL_IMAGE) {
             qCWarning(LOG_JXLPLUGIN, "Unexpected event %d instead of JXL_DEC_FULL_IMAGE", status);
             m_parseState = ParseJpegXLError;
@@ -1844,6 +1876,11 @@ bool QJpegXLHandler::rewind()
 
     JxlDecoderReleaseInput(m_decoder);
     JxlDecoderRewind(m_decoder);
+    if (KImageFormats::decodeContext.feedback &&
+        JxlDecoderSetProgressiveDetail(m_decoder, kPasses) != JXL_DEC_SUCCESS) {
+        m_parseState = ParseJpegXLError;
+        return false;
+    }
     if (m_runner) {
         if (JxlDecoderSetParallelRunner(m_decoder, JxlThreadParallelRunner, m_runner) != JXL_DEC_SUCCESS) {
             qCWarning(LOG_JXLPLUGIN, "ERROR: JxlDecoderSetParallelRunner failed");
@@ -1861,13 +1898,14 @@ bool QJpegXLHandler::rewind()
     JxlDecoderCloseInput(m_decoder);
 
     if (m_basicinfo.uses_original_profile == JXL_FALSE && m_basicinfo.have_animation == JXL_FALSE) {
-        if (JxlDecoderSubscribeEvents(m_decoder, JXL_DEC_COLOR_ENCODING | JXL_DEC_FULL_IMAGE) != JXL_DEC_SUCCESS) {
+        if (JxlDecoderSubscribeEvents(m_decoder, JXL_DEC_COLOR_ENCODING | JXL_DEC_FULL_IMAGE |
+                (!m_isCMYK && KImageFormats::decodeContext.feedback ? JXL_DEC_FRAME_PROGRESSION : 0)) != JXL_DEC_SUCCESS) {
             qCWarning(LOG_JXLPLUGIN, "ERROR: JxlDecoderSubscribeEvents failed");
             m_parseState = ParseJpegXLError;
             return false;
         }
 
-        JxlDecoderStatus status = JxlDecoderProcessInput(m_decoder);
+        JxlDecoderStatus status = processJxlInput(m_decoder);
         if (status != JXL_DEC_COLOR_ENCODING) {
             qCWarning(LOG_JXLPLUGIN, "Unexpected event %d instead of JXL_DEC_COLOR_ENCODING", status);
             m_parseState = ParseJpegXLError;
@@ -1892,7 +1930,8 @@ bool QJpegXLHandler::rewind()
         JxlColorEncodingSetToSRGB(&color_encoding, is_gray ? JXL_TRUE : JXL_FALSE);
         JxlDecoderSetPreferredColorProfile(m_decoder, &color_encoding);
     } else {
-        if (JxlDecoderSubscribeEvents(m_decoder, JXL_DEC_FULL_IMAGE) != JXL_DEC_SUCCESS) {
+        if (JxlDecoderSubscribeEvents(m_decoder, JXL_DEC_FULL_IMAGE |
+                (!m_isCMYK && KImageFormats::decodeContext.feedback ? JXL_DEC_FRAME_PROGRESSION : 0)) != JXL_DEC_SUCCESS) {
             qCWarning(LOG_JXLPLUGIN, "ERROR: JxlDecoderSubscribeEvents failed");
             m_parseState = ParseJpegXLError;
             return false;
@@ -1922,6 +1961,11 @@ bool QJpegXLHandler::decodeContainer()
 
     JxlDecoderReleaseInput(m_decoder);
     JxlDecoderRewind(m_decoder);
+    if (KImageFormats::decodeContext.feedback &&
+        JxlDecoderSetProgressiveDetail(m_decoder, kPasses) != JXL_DEC_SUCCESS) {
+        m_parseState = ParseJpegXLError;
+        return false;
+    }
 
     if (JxlDecoderSetInput(m_decoder, buf, len) != JXL_DEC_SUCCESS) {
         qCWarning(LOG_JXLPLUGIN, "ERROR: JxlDecoderSetInput failed");
@@ -1949,7 +1993,7 @@ bool QJpegXLHandler::decodeContainer()
     QByteArray xmpBox;
 
     while (search_exif || search_xmp) {
-        JxlDecoderStatus status = JxlDecoderProcessInput(m_decoder);
+        JxlDecoderStatus status = processJxlInput(m_decoder);
         switch (status) {
         case JXL_DEC_SUCCESS:
             search_exif = false;
@@ -2052,7 +2096,7 @@ bool QJpegXLHandler::extractBox(QByteArray &output, size_t container_size)
     }
 
     do {
-        status = JxlDecoderProcessInput(m_decoder);
+        status = processJxlInput(m_decoder);
         if (status == JXL_DEC_BOX_NEED_MORE_OUTPUT) {
             size_t bytes_remains = JxlDecoderReleaseBoxBuffer(m_decoder);
 

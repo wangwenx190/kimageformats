@@ -7,6 +7,7 @@
 */
 
 #include <QThread>
+#include "kimageformats_decode_feedback.h"
 #include <QtGlobal>
 
 #include <QColorSpace>
@@ -165,9 +166,12 @@ bool QAVIFHandler::initDecoder(bool ignore_exif)
         return false;
     }
 
+    m_decoder->allowProgressive = KImageFormats::decodeContext.feedback &&
+        bool(KImageFormats::decodeContext.feedback->preview) ? AVIF_TRUE : AVIF_FALSE;
     m_decoder->ignoreExif = ignore_exif ? AVIF_TRUE : AVIF_FALSE;
 
-    m_decoder->maxThreads = qBound(1, QThread::idealThreadCount(), 64);
+    const int threads = KImageFormats::decodeContext.threads;
+    m_decoder->maxThreads = threads > 0 ? threads : qBound(1, QThread::idealThreadCount(), 64);
 
     m_decoder->strictFlags = AVIF_STRICT_DISABLED;
 
@@ -1189,7 +1193,18 @@ bool QAVIFHandler::jumpToNextImage()
         }
     }
 
+    auto *feedback = KImageFormats::decodeContext.feedback;
+    if (feedback && feedback->stopped()) return false;
     avifResult decodeResult = avifDecoderNextImage(m_decoder);
+    while (decodeResult == AVIF_RESULT_OK &&
+           m_decoder->progressiveState == AVIF_PROGRESSIVE_STATE_ACTIVE &&
+           m_decoder->imageIndex + 1 < m_decoder->imageCount) {
+        if (feedback && feedback->stopped()) return false;
+        if (feedback && !feedback->delivered && decode_one_frame())
+            feedback->offer(m_current_image);
+        if (feedback && feedback->stopped()) return false;
+        decodeResult = avifDecoderNextImage(m_decoder);
+    }
 
     if (decodeResult != AVIF_RESULT_OK) {
         qCWarning(LOG_AVIFPLUGIN, "ERROR: Failed to decode Next image in sequence: %s", avifResultToString(decodeResult));

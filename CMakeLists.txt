@@ -1,145 +1,66 @@
-cmake_minimum_required(VERSION 3.30)
-
-set(KF_VERSION "6.33.0") # handled by release scripts
-set(KF_DEP_VERSION "6.32.0") # handled by release scripts
-project(KImageFormats VERSION ${KF_VERSION})
-
-include(FeatureSummary)
-find_package(ECM 6.32.0  NO_MODULE)
-set_package_properties(ECM PROPERTIES TYPE REQUIRED DESCRIPTION "Extra CMake Modules." URL "https://commits.kde.org/extra-cmake-modules")
-feature_summary(WHAT REQUIRED_PACKAGES_NOT_FOUND FATAL_ON_MISSING_REQUIRED_PACKAGES)
-
-
-set(CMAKE_MODULE_PATH ${KImageFormats_SOURCE_DIR}/cmake/find-modules ${ECM_MODULE_PATH})
-
-include(KDEInstallDirs)
-include(KDEFrameworkCompilerSettings NO_POLICY_SCOPE)
-include(KDECMakeSettings)
-
-include(KDEGitCommitHooks)
-include(ECMDeprecationSettings)
-include(CheckIncludeFiles)
-include(FindPkgConfig)
-
-set(REQUIRED_QT_VERSION 6.10.0)
-find_package(Qt6Gui ${REQUIRED_QT_VERSION} REQUIRED NO_MODULE)
-
-find_package(KF6Archive ${KF_DEP_VERSION})
-set_package_properties(KF6Archive PROPERTIES
-    TYPE OPTIONAL
-    PURPOSE "Required for the QImage plugin for Krita and OpenRaster images"
-)
-
-# EPS support depends on the gs utility; non-UNIX systems are unlikely to have
-# this available in PATH
-set(BUILD_EPS_PLUGIN FALSE)
-if (UNIX)
-    find_package(Qt6PrintSupport ${REQUIRED_QT_VERSION} NO_MODULE)
-    set_package_properties(Qt6PrintSupport PROPERTIES
-        PURPOSE "Required for the QImage plugin for EPS images"
-        TYPE OPTIONAL
-    )
-    if (TARGET Qt6::PrintSupport)
-        set(BUILD_EPS_PLUGIN TRUE)
-    endif()
+cmake_minimum_required(VERSION 3.25)
+project(KImageFormats VERSION 6.33.0 LANGUAGES CXX)
+find_package(Qt6 6.10 REQUIRED COMPONENTS Gui)
+if(TARGET avif)
+    set(avif_library avif)
+else()
+    find_path(avif_include avif/avif.h REQUIRED)
+    find_library(avif_library NAMES avif REQUIRED)
+endif()
+if(TARGET jxl AND TARGET jxl_threads)
+    set(jxl_libraries jxl jxl_threads)
+else()
+    find_path(jxl_include jxl/decode.h REQUIRED)
+    find_library(jxl_library NAMES jxl REQUIRED)
+    find_library(jxl_threads_library NAMES jxl_threads REQUIRED)
+    find_library(jxl_cms_library NAMES jxl_cms REQUIRED)
+    set(jxl_libraries "${jxl_library}" "${jxl_threads_library}" "${jxl_cms_library}")
 endif()
 
-find_package(OpenEXR 3.0 CONFIG QUIET)
-if(NOT OpenEXR_FOUND)
-    find_package(OpenEXR)
+option(KIMAGEFORMATS_BUILD_STATIC "Build static Qt image plugins" ON)
+option(KIMAGEFORMATS_BUILD_DYNAMIC "Build dynamic Qt image plugins" ON)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(source_dir src/imageformats)
+add_library(kimg_microexif STATIC "${source_dir}/microexif.cpp")
+target_link_libraries(kimg_microexif PRIVATE Qt6::Gui)
+set_target_properties(kimg_microexif PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+function(add_codec codec plugin_class include_directory)
+    foreach(kind IN ITEMS STATIC DYNAMIC)
+        if(KIMAGEFORMATS_BUILD_${kind})
+            string(TOLOWER "${kind}" suffix)
+            set(plugin "kimg_${codec}_${suffix}")
+            if(kind STREQUAL "STATIC")
+                add_library(${plugin} STATIC)
+                target_compile_definitions(${plugin} PRIVATE QT_STATICPLUGIN)
+                set_target_properties(${plugin} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+            else()
+                qt_add_plugin(${plugin} SHARED CLASS_NAME ${plugin_class} PLUGIN_TYPE imageformats)
+            endif()
+            target_sources(${plugin} PRIVATE "${source_dir}/${codec}.cpp"
+                "${source_dir}/${codec}_p.h")
+            target_include_directories(${plugin} PRIVATE "${include_directory}")
+            target_link_libraries(${plugin} PRIVATE Qt6::Gui kimg_microexif ${ARGN})
+        endif()
+    endforeach()
+endfunction()
+
+add_codec(avif QAVIFPlugin "${avif_include}" "${avif_library}")
+add_codec(jxl QJpegXLPlugin "${jxl_include}" ${jxl_libraries})
+
+if(WIN32)
+    string(REPLACE "." "," resource_version_csv "${PROJECT_VERSION}")
+    set(resource_version "${PROJECT_VERSION}")
+    foreach(library IN ITEMS kimg_avif_dynamic kimg_jxl_dynamic)
+        if(TARGET ${library})
+            get_target_property(library_type ${library} TYPE)
+            if(library_type STREQUAL "SHARED_LIBRARY" OR library_type STREQUAL "MODULE_LIBRARY")
+                enable_language(RC)
+                configure_file(cmake/LibraryVersion.rc.in LibraryVersion.rc @ONLY)
+                target_sources(${library} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/LibraryVersion.rc")
+            endif()
+        endif()
+    endforeach()
 endif()
-set_package_properties(OpenEXR PROPERTIES
-    TYPE OPTIONAL
-    PURPOSE "Required for the QImage plugin for OpenEXR images"
-)
-
-find_package(libavif 1 CONFIG)
-set_package_properties(libavif PROPERTIES
-    TYPE OPTIONAL
-    PURPOSE "Required for the QImage plugin for AVIF images"
-)
-
-option(KIMAGEFORMATS_DDS "Enable plugin for DDS format" ON)
-
-option(KIMAGEFORMATS_HEIF "Enable plugin for HEIF format" OFF)
-set(KIMAGEFORMATS_HEIC_TEST "ALL" CACHE STRING "Enable HEIC tests: OFF, READ_ONLY, ALL")
-set_property(CACHE KIMAGEFORMATS_HEIC_TEST PROPERTY STRINGS "OFF" "READ_ONLY" "ALL")
-set(KIMAGEFORMATS_HEIF_TEST "ALL" CACHE STRING "Enable HEIF tests: OFF, ALL")
-set_property(CACHE KIMAGEFORMATS_HEIF_TEST PROPERTY STRINGS "OFF" "ALL")
-set(KIMAGEFORMATS_HEJ2_TEST "ALL" CACHE STRING "Enable HEJ2 tests: OFF, READ_ONLY, ALL")
-set_property(CACHE KIMAGEFORMATS_HEJ2_TEST PROPERTY STRINGS "OFF" "READ_ONLY" "ALL")
-set(KIMAGEFORMATS_AVCI_TEST "ALL" CACHE STRING "Enable AVCI tests: OFF, ALL")
-set_property(CACHE KIMAGEFORMATS_AVCI_TEST PROPERTY STRINGS "OFF" "ALL")
-if(KIMAGEFORMATS_HEIF)
-    pkg_check_modules(LibHeif IMPORTED_TARGET libheif>=1.17.0)
-endif()
-add_feature_info(LibHeif LibHeif_FOUND "required for the QImage plugin for HEIF/HEIC images")
-
-option(KIMAGEFORMATS_JXL "Enable plugin for JPEG XL format" ON)
-if(KIMAGEFORMATS_JXL)
-    pkg_check_modules(LibJXL IMPORTED_TARGET libjxl>=0.9.4)
-    pkg_check_modules(LibJXLThreads IMPORTED_TARGET libjxl_threads>=0.9.4)
-    pkg_check_modules(LibJXLCMS IMPORTED_TARGET libjxl_cms>=0.9.4)
-endif()
-add_feature_info(LibJXL LibJXL_FOUND "required for the QImage plugin for JPEG XL images")
-
-option(KIMAGEFORMATS_JP2 "Enable plugin for JPEG 2000 format" ON)
-if(KIMAGEFORMATS_JP2)
-    find_package(OpenJPEG CONFIG)
-endif()
-add_feature_info(OpenJPEG OpenJPEG_FOUND "required for the QImage plugin for JPEG 2000 images")
-
-
-find_package(LibRaw 0.20.2)
-set_package_properties(LibRaw PROPERTIES
-    TYPE OPTIONAL
-    PURPOSE "Required for the QImage plugin for RAW images"
-)
-
-# JXR plugin disabled by default due to security issues.
-# You should not enable it unless you know what you are doing.
-option(KIMAGEFORMATS_WITH_KNOWN_CRASHES_JXR "Enable plugin for JPEG XR format" OFF)
-if(KIMAGEFORMATS_WITH_KNOWN_CRASHES_JXR)
-    find_package(LibJXR)
-endif()
-add_feature_info(LibJXR LibJXR_FOUND "required for the QImage plugin for JPEG XR images")
-
-option(KIMAGEFORMATS_EXPOSE_LIBVER "Store the version of the underlying library in the image metadata" OFF)
-
-ecm_set_disabled_deprecation_versions(
-    QT 6.11.0
-    KF 6.32.0
-)
-
-add_subdirectory(src)
-if (BUILD_TESTING)
-    add_subdirectory(autotests)
-    add_subdirectory(tests)
-endif()
-
-set(CMAKECONFIG_INSTALL_DIR "${KDE_INSTALL_CMAKEPACKAGEDIR}/KF6ImageFormats")
-include(CMakePackageConfigHelpers)
-
-write_basic_package_version_file(
-    "${CMAKE_CURRENT_BINARY_DIR}/KF6ImageFormatsConfigVersion.cmake"
-    VERSION ${PROJECT_VERSION}
-    COMPATIBILITY AnyNewerVersion
-)
-
-configure_package_config_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/KF6ImageFormatsConfig.cmake.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/KF6ImageFormatsConfig.cmake"
-    INSTALL_DESTINATION "${CMAKECONFIG_INSTALL_DIR}"
-)
-
-install(FILES
-  "${CMAKE_CURRENT_BINARY_DIR}/KF6ImageFormatsConfig.cmake"
-  "${CMAKE_CURRENT_BINARY_DIR}/KF6ImageFormatsConfigVersion.cmake"
-  DESTINATION "${CMAKECONFIG_INSTALL_DIR}"
-  COMPONENT Devel
-)
-
-include(ECMFeatureSummary)
-ecm_feature_summary(WHAT ALL FATAL_ON_MISSING_REQUIRED_PACKAGES)
-
-kde_configure_git_pre_commit_hook(CHECKS CLANG_FORMAT)
